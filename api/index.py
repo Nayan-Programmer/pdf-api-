@@ -5,48 +5,27 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-
 app = FastAPI(
-    title="EchooAI PDF Generator",
+    title="EchooAI PDF Generator API",
     version="1.0.0",
-    description="HTML to PDF API powered by FastAPI and Gotenberg",
 )
 
-GOTENBERG_URL = os.getenv(
-    "GOTENBERG_URL",
-    "http://localhost:3000"
-).rstrip("/")
-
+GOTENBERG_URL = os.getenv("GOTENBERG_URL", "").rstrip("/")
 API_KEY = os.getenv("API_KEY")
 
 
 class PDFRequest(BaseModel):
     html: str = Field(..., min_length=1)
-    filename: str = Field(default="document.pdf", max_length=100)
+    filename: str = "document.pdf"
 
 
-def check_api_key(authorization: str | None):
-    # Authentication is optional locally.
+def authenticate(authorization: str | None):
     if not API_KEY:
         return
 
-    if not authorization:
+    if authorization != f"Bearer {API_KEY}":
         raise HTTPException(
             status_code=401,
-            detail="Missing Authorization header"
-        )
-
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Use Bearer authentication"
-        )
-
-    token = authorization[7:]
-
-    if token != API_KEY:
-        raise HTTPException(
-            status_code=403,
             detail="Invalid API key"
         )
 
@@ -54,24 +33,29 @@ def check_api_key(authorization: str | None):
 @app.get("/")
 async def root():
     return {
-        "name": "EchooAI PDF Generator",
+        "service": "EchooAI PDF Generator",
         "status": "online",
-        "engine": "Gotenberg",
-        "version": "1.0.0",
+        "docs": "/docs"
     }
 
 
 @app.get("/health")
 async def health():
+    if not GOTENBERG_URL:
+        return {
+            "api": "ok",
+            "gotenberg": "not configured"
+        }
+
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.get(
+            r = await client.get(
                 f"{GOTENBERG_URL}/health"
             )
 
         return {
             "api": "ok",
-            "gotenberg": response.status_code == 200
+            "gotenberg": r.status_code == 200
         }
 
     except Exception:
@@ -82,11 +66,17 @@ async def health():
 
 
 @app.post("/api/generate")
-async def generate_pdf(
+async def generate(
     request: PDFRequest,
-    authorization: str | None = Header(default=None),
+    authorization: str | None = Header(default=None)
 ):
-    check_api_key(authorization)
+    authenticate(authorization)
+
+    if not GOTENBERG_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="GOTENBERG_URL is not configured"
+        )
 
     html = f"""
 <!DOCTYPE html>
@@ -95,27 +85,23 @@ async def generate_pdf(
 <meta charset="UTF-8">
 
 <style>
-
 @page {{
     size: A4;
     margin: 20mm;
 }}
 
 body {{
-    font-family: Arial, Helvetica, sans-serif;
+    font-family: Arial, sans-serif;
     color: #111827;
     line-height: 1.6;
-    font-size: 14px;
 }}
 
 h1 {{
     font-size: 30px;
-    margin-bottom: 20px;
 }}
 
 h2 {{
     font-size: 20px;
-    margin-top: 25px;
 }}
 
 </style>
@@ -123,50 +109,40 @@ h2 {{
 </head>
 
 <body>
-
 {request.html}
-
 </body>
+
 </html>
 """
 
-    files = {
-        "files": (
-            "index.html",
-            html.encode("utf-8"),
-            "text/html",
-        )
-    }
-
     try:
-        async with httpx.AsyncClient(
-            timeout=60
-        ) as client:
-
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 f"{GOTENBERG_URL}/forms/chromium/convert/html",
-                files=files,
+                files={
+                    "files": (
+                        "index.html",
+                        html.encode("utf-8"),
+                        "text/html"
+                    )
+                }
             )
 
     except httpx.RequestError as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Gotenberg unavailable: {str(e)}"
+            detail=f"Gotenberg connection failed: {e}"
         )
 
     if response.status_code != 200:
         raise HTTPException(
             status_code=502,
-            detail={
-                "message": "Gotenberg failed",
-                "status": response.status_code,
-                "response": response.text[:1000],
-            }
+            detail="Gotenberg failed to generate PDF"
         )
 
     filename = request.filename
 
-    if not filename.lower().endswith(".pdf"):
+    if not filename.endswith(".pdf"):
         filename += ".pdf"
 
     return Response(
@@ -175,5 +151,5 @@ h2 {{
         headers={
             "Content-Disposition":
                 f'attachment; filename="{filename}"'
-        },
+        }
     )
